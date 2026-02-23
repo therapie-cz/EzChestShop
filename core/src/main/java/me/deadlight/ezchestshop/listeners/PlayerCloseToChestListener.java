@@ -104,29 +104,39 @@ public class PlayerCloseToChestListener implements Listener {
         }
 
         Location loc = player.getLocation();
-        List<EzShop> shops = ShopContainer.getShops().stream()
-                .filter(ezShop -> ezShop.getLocation() != null
-                        && loc.getWorld().equals(ezShop.getLocation().getWorld())
-                        && loc.distance(ezShop.getLocation()) < Config.holodistancing_distance + 5)
-                .toList();
-        for (EzShop ezShop : shops) {
+        // Pre-calculate squared thresholds for show/hide logic
+        double showDistanceSquared = Config.holodistancing_distance * Config.holodistancing_distance;
+        double hideMinDistanceSquared = (Config.holodistancing_distance + 1) * (Config.holodistancing_distance + 1);
+        double hideMaxDistanceSquared = (Config.holodistancing_distance + 3) * (Config.holodistancing_distance + 3);
+
+        // Use chunk-based spatial index for O(1) lookup instead of O(n) iteration
+        List<EzShop> nearbyShops = ShopContainer.getShopsNearby(loc, Config.holodistancing_distance + 5);
+
+        for (EzShop ezShop : nearbyShops) {
+            Location shopLoc = ezShop.getLocation();
+            if (shopLoc == null) continue;
+
+            double distSquared = loc.distanceSquared(shopLoc);
+            // Skip shops outside our range (chunk-based lookup is approximate)
+            if (distSquared >= hideMaxDistanceSquared) continue;
+
             if (EzChestShop.slimefun) {
-                if (BlockStorage.hasBlockInfo(ezShop.getLocation())) {
-                    ShopContainer.deleteShop(ezShop.getLocation());
+                if (BlockStorage.hasBlockInfo(shopLoc)) {
+                    ShopContainer.deleteShop(shopLoc);
                     continue;
                 }
             }
-            double dist = loc.distance(ezShop.getLocation());
+
             // Show the Hologram if Player close enough
-            if (dist < Config.holodistancing_distance) {
-                if (ShopHologram.hasHologram(ezShop.getLocation(), player))
+            if (distSquared < showDistanceSquared) {
+                if (ShopHologram.hasHologram(shopLoc, player))
                     continue;
 
-                Block target = ezShop.getLocation().getWorld().getBlockAt(ezShop.getLocation());
+                Block target = shopLoc.getWorld().getBlockAt(shopLoc);
                 if (!Utils.isApplicableContainer(target)) {
                     return;
                 }
-                ShopHologram shopHolo = ShopHologram.getHologram(ezShop.getLocation(), player);
+                ShopHologram shopHolo = ShopHologram.getHologram(shopLoc, player);
                 if (Config.holodistancing_show_item_first) {
                     shopHolo.showOnlyItem();
                     shopHolo.showAlwaysVisibleText();
@@ -136,9 +146,9 @@ public class PlayerCloseToChestListener implements Listener {
 
             }
             // Hide the Hologram that is too far away from the player
-            else if (dist > Config.holodistancing_distance + 1 && dist < Config.holodistancing_distance + 3) {
+            else if (distSquared > hideMinDistanceSquared && distSquared < hideMaxDistanceSquared) {
                 // Hide the Hologram
-                ShopHologram hologram = ShopHologram.getHologram(ezShop.getLocation(), player);
+                ShopHologram hologram = ShopHologram.getHologram(shopLoc, player);
                 if (hologram != null) {
                     hologram.hide();
                 }

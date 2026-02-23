@@ -30,15 +30,18 @@ public final class FlagRegistry {
     private static StateFlag registerStateFlag(String name, boolean def) {
         var registry = WorldGuard.getInstance().getFlagRegistry();
 
+        // Check if flag already exists (e.g., during hot-reload)
+        if (registry.get(name) instanceof StateFlag existingFlag) {
+            return existingFlag;
+        }
+
         try {
             StateFlag flag = new StateFlag(name, def);
             registry.register(flag);
             return flag;
-        } catch (FlagConflictException e) {
-            // Logging to help gather information regarding this bug: https://github.com/nouish/EzChestShop/issues/50
-
-            // I suspect there probably is no good reason to repeat this now...
-            // But this is the previous implementation, so I'll keep it.
+        } catch (FlagConflictException | IllegalStateException e) {
+            // FlagConflictException: flag name conflict
+            // IllegalStateException: registration after server start (hot-reload via PlugMan)
             if (registry.get(name) instanceof StateFlag flag) {
                 EzChestShop.logger().warn("Conflict creating flag '{}', but found cached match.", name, e);
                 return flag;

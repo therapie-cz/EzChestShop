@@ -2,11 +2,14 @@ package me.deadlight.ezchestshop.data;
 
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import me.deadlight.ezchestshop.EzChestShop;
 import me.deadlight.ezchestshop.Constants;
@@ -52,7 +55,104 @@ public class ShopContainer {
     private static final Economy econ = EzChestShop.getEconomy();
     private static final HashMap<Location, EzShop> shopMap = new HashMap<>();
 
+    // Chunk-based spatial index for fast nearby shop lookups
+    // Key: World -> ChunkKey (long) -> List of shops in that chunk
+    private static final Map<World, Map<Long, List<EzShop>>> chunkIndex = new ConcurrentHashMap<>();
+
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ISO_DATE_TIME;
+
+    /**
+     * Convert chunk coordinates to a single long key for efficient lookup.
+     */
+    private static long chunkKey(int chunkX, int chunkZ) {
+        return ((long) chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
+    }
+
+    /**
+     * Add a shop to the chunk index.
+     */
+    private static void addToChunkIndex(EzShop shop) {
+        Location loc = shop.getLocation();
+        if (loc == null || loc.getWorld() == null) return;
+
+        World world = loc.getWorld();
+        long key = chunkKey(loc.getBlockX() >> 4, loc.getBlockZ() >> 4);
+
+        chunkIndex.computeIfAbsent(world, w -> new ConcurrentHashMap<>())
+                  .computeIfAbsent(key, k -> new ArrayList<>())
+                  .add(shop);
+    }
+
+    /**
+     * Remove a shop from the chunk index.
+     */
+    private static void removeFromChunkIndex(Location loc) {
+        if (loc == null || loc.getWorld() == null) return;
+
+        World world = loc.getWorld();
+        long key = chunkKey(loc.getBlockX() >> 4, loc.getBlockZ() >> 4);
+
+        Map<Long, List<EzShop>> worldIndex = chunkIndex.get(world);
+        if (worldIndex != null) {
+            List<EzShop> chunkShops = worldIndex.get(key);
+            if (chunkShops != null) {
+                chunkShops.removeIf(shop -> loc.equals(shop.getLocation()));
+                if (chunkShops.isEmpty()) {
+                    worldIndex.remove(key);
+                }
+            }
+        }
+    }
+
+    /**
+     * Rebuild the entire chunk index from shopMap.
+     */
+    private static void rebuildChunkIndex() {
+        chunkIndex.clear();
+        for (EzShop shop : shopMap.values()) {
+            addToChunkIndex(shop);
+        }
+    }
+
+    /**
+     * Get all shops within a radius of a location.
+     * Uses chunk-based lookup for O(1) performance instead of O(n) iteration.
+     *
+     * @param center The center location
+     * @param radius The search radius in blocks
+     * @return List of shops within the radius (unfiltered by exact distance)
+     */
+    public static List<EzShop> getShopsNearby(Location center, double radius) {
+        if (center == null || center.getWorld() == null) {
+            return Collections.emptyList();
+        }
+
+        World world = center.getWorld();
+        Map<Long, List<EzShop>> worldIndex = chunkIndex.get(world);
+        if (worldIndex == null) {
+            return Collections.emptyList();
+        }
+
+        // Calculate chunk range to search
+        int centerChunkX = center.getBlockX() >> 4;
+        int centerChunkZ = center.getBlockZ() >> 4;
+        int chunkRadius = (int) Math.ceil(radius / 16.0) + 1;
+
+        List<EzShop> result = new ArrayList<>();
+
+        // Only iterate over relevant chunks
+        for (int dx = -chunkRadius; dx <= chunkRadius; dx++) {
+            for (int dz = -chunkRadius; dz <= chunkRadius; dz++) {
+                long key = chunkKey(centerChunkX + dx, centerChunkZ + dz);
+                List<EzShop> chunkShops = worldIndex.get(key);
+                if (chunkShops != null) {
+                    result.addAll(chunkShops);
+                }
+            }
+        }
+
+        return result;
+    }
 
     /**
      * Save all shops from the Database into memory,
@@ -62,6 +162,7 @@ public class ShopContainer {
         DatabaseManager db = EzChestShop.getPlugin().getDatabase();
         shopMap.clear();
         shopMap.putAll(db.queryShops());
+        rebuildChunkIndex();
         LOGGER.info("Loaded and cached {} shops.", shopMap.size());
     }
 
@@ -74,6 +175,7 @@ public class ShopContainer {
         DatabaseManager db = EzChestShop.getPlugin().getDatabase();
         db.deleteEntry("location", Utils.LocationtoString(loc), "shopdata");
         shopMap.remove(loc);
+        removeFromChunkIndex(loc);
 
         //This is not workign as intended
 //        InventoryHolder inventoryHolder = (InventoryHolder) loc.getBlock();
@@ -109,6 +211,7 @@ public class ShopContainer {
         ShopSettings settings = new ShopSettings(sloc, msgtoggle, dbuy, dsell, admins, shareincome, adminshop, rotation, new ArrayList<>());
         EzShop shop = new EzShop(loc, p, item, buyprice, sellprice, settings);
         shopMap.put(loc, shop);
+        addToChunkIndex(shop);
 
         ItemMeta meta = item.getItemMeta();
         World world = requireNonNull(loc.getWorld(), "Location cannot be in null world");
@@ -157,7 +260,8 @@ public class ShopContainer {
 
         ShopSettings settings = new ShopSettings(sloc, msgtoggle, dbuy, dsell, admins, shareincome, adminshop, rotation, new ArrayList<>());
         EzShop shop = new EzShop(loc, owner, Utils.decodeItem(encodedItem), buyprice, sellprice, settings);
-        shopMap.put(loc, shop);;
+        shopMap.put(loc, shop);
+        addToChunkIndex(shop);
     }
 
     public static PersistentDataContainer copyContainerData(PersistentDataContainer oldContainer, PersistentDataContainer newContainer) {
@@ -267,6 +371,7 @@ public class ShopContainer {
             ShopSettings settings = new ShopSettings(sloc, msgtoggle, dbuy, dsell, admins, shareincome, adminshop, rotation, new ArrayList<>());
             shop = new EzShop(loc, owner, Utils.decodeItem(encodedItem), buyprice, sellprice, settings);
             shopMap.put(loc, shop);
+            addToChunkIndex(shop);
             return settings;
         }
     }
